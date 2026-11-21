@@ -1,0 +1,159 @@
+// ==UserScript==
+// @name         RGPV Attendance & Marks Auto-Fill
+// @namespace    http://tampermonkey.net/
+// @version      3.2
+// @description  Upload multi-sheet Excel file to auto-fill RGPV Attendance or Marks
+// @match        *://rgpv.ac.in/*
+// @match        *://*.rgpv.ac.in/*
+// @match        file://*/*
+// @require      https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    let globalWorkbook = null;
+
+    function init() {
+        const container = document.createElement('div');
+        container.style.cssText = 'position:fixed; top:15px; right:15px; z-index:99999; background:#ffffff; border:2px solid #007bff; padding:14px; border-radius:8px; box-shadow:0 4px 12px rgba(0,0,0,0.2); font-family:Arial, sans-serif; min-width:230px;';
+
+        container.innerHTML = `
+            <div style="font-weight:bold; margin-bottom:10px; color:#007bff; text-align:center;">RGPV Auto-Fill Panel</div>
+            <input type="file" id="excelFileInput" accept=".xlsx, .xls" style="display:none;" />
+            <button id="uploadExcelBtn" style="background:#007bff; color:white; font-weight:bold; border:none; padding:8px 12px; border-radius:4px; cursor:pointer; width:100%; margin-bottom:10px;">📁 Upload Excel File</button>
+            
+            <div id="sheetDropdownContainer" style="display:none;">
+                <label style="font-size:12px; font-weight:bold; display:block; margin-bottom:4px; color:#333;">Select Sheet:</label>
+                <select id="sheetSelect" style="width:100%; padding:6px; margin-bottom:10px; border-radius:4px; border:1px solid #ccc;"></select>
+                <button id="fillDataBtn" style="background:#28a745; color:white; font-weight:bold; border:none; padding:8px 12px; border-radius:4px; cursor:pointer; width:100%;">⚡ Fill Data</button>
+            </div>
+            <div id="statusLabel" style="font-size:12px; color:#555; margin-top:8px; text-align:center;">Ready</div>
+        `;
+
+        document.body.appendChild(container);
+
+        const fileInput = document.getElementById('excelFileInput');
+        const uploadBtn = document.getElementById('uploadExcelBtn');
+        const dropdownContainer = document.getElementById('sheetDropdownContainer');
+        const sheetSelect = document.getElementById('sheetSelect');
+        const fillBtn = document.getElementById('fillDataBtn');
+        const statusLabel = document.getElementById('statusLabel');
+
+        uploadBtn.onclick = () => fileInput.click();
+
+        fileInput.onchange = function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(evt) {
+                try {
+                    const data = new Uint8Array(evt.target.result);
+                    globalWorkbook = XLSX.read(data, { type: 'array' });
+
+                    sheetSelect.innerHTML = '';
+                    globalWorkbook.SheetNames.forEach(sheetName => {
+                        const option = document.createElement('option');
+                        option.value = sheetName;
+                        option.textContent = sheetName;
+                        sheetSelect.appendChild(option);
+                    });
+
+                    dropdownContainer.style.display = 'block';
+                    statusLabel.innerText = `Loaded ${globalWorkbook.SheetNames.length} sheet(s).`;
+                    statusLabel.style.color = '#007bff';
+                } catch (err) {
+                    statusLabel.innerText = 'Error reading Excel file.';
+                    statusLabel.style.color = '#dc3545';
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        };
+
+        fillBtn.onclick = function() {
+            if (!globalWorkbook) {
+                alert('Please upload an Excel file first.');
+                return;
+            }
+
+            const selectedSheet = sheetSelect.value;
+            const worksheet = globalWorkbook.Sheets[selectedSheet];
+            const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+
+            // Automatically find the header row (even if there are college/subject titles above it)
+            let headerRowIdx = -1;
+            let enrollIdx = -1;
+            let valIdx = -1;
+
+            for (let r = 0; r < Math.min(jsonData.length, 15); r++) {
+                if (!jsonData[r]) continue;
+                const rowHeaders = jsonData[r].map(h => String(h || '').trim().toLowerCase());
+                
+                const eIdx = rowHeaders.findIndex(h => h.includes('roll') || h.includes('enrollment'));
+                const vIdx = rowHeaders.findIndex(h => 
+                    (h.includes('attendance') && !h.includes('%') && !h.includes('percent')) || 
+                    h.includes('mark') || 
+                    h.includes('score')
+                );
+
+                if (eIdx !== -1 && vIdx !== -1) {
+                    headerRowIdx = r;
+                    enrollIdx = eIdx;
+                    valIdx = vIdx;
+                    break;
+                }
+            }
+
+            if (headerRowIdx === -1) {
+                alert(`Could not find "Roll No." and "Attendance" (or "Marks") columns in sheet: ${selectedSheet}`);
+                return;
+            }
+
+            // Map Roll No. -> Attendance/Marks Value
+            const dataMap = {};
+            for (let i = headerRowIdx + 1; i < jsonData.length; i++) {
+                const row = jsonData[i];
+                if (row && row[enrollIdx]) {
+                    const enrollNo = String(row[enrollIdx]).trim().toUpperCase();
+                    const cellVal = row[valIdx] !== undefined ? String(row[valIdx]).trim() : '';
+                    if (cellVal !== '') {
+                        dataMap[enrollNo] = cellVal;
+                    }
+                }
+            }
+
+            // Populate matching rows in the RGPV portal table
+            const rows = document.querySelectorAll('table tr');
+            let filledCount = 0;
+
+            rows.forEach(row => {
+                const rowText = row.innerText.toUpperCase();
+                Object.keys(dataMap).forEach(enrollmentNo => {
+                    if (rowText.includes(enrollmentNo)) {
+                        const inputField = row.querySelector('input[type="text"], input[type="number"]');
+                        if (inputField && !inputField.disabled && !inputField.readOnly) {
+                            inputField.value = dataMap[enrollmentNo];
+                            
+                            inputField.dispatchEvent(new Event('input', { bubbles: true }));
+                            inputField.dispatchEvent(new Event('change', { bubbles: true }));
+                            inputField.dispatchEvent(new Event('blur', { bubbles: true }));
+                            filledCount++;
+                        }
+                    }
+                });
+            });
+
+            statusLabel.innerText = `Filled ${filledCount} entries!`;
+            statusLabel.style.color = '#28a745';
+            alert(`Successfully filled ${filledCount} entries from "${selectedSheet}"!`);
+        };
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
